@@ -1,0 +1,27 @@
+services:
+  asterisk:
+    image: andrius/asterisk:latest
+    container_name: asterisk-dograh-gateway
+    restart: always
+    volumes:
+      - ./config/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./config/ari.conf:/etc/asterisk/ari.conf:ro
+      - ./config/http.conf:/etc/asterisk/http.conf:ro
+      - ./config/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./config/websocket_client.conf:/etc/asterisk/websocket_client.conf:ro
+      - ./config/modules.conf:/etc/asterisk/modules.conf:ro
+    ports:
+      - "5060:5060/udp"
+      - "10000-10099:10000-10099/udp"
+
+  ari-proxy:
+    image: python:3.10-slim
+    container_name: asterisk-ari-proxy
+    restart: always
+    volumes:
+      - ./config/ari_proxy.py:/app/ari_proxy.py:ro
+    command: python /app/ari_proxy.py
+    ports:
+      - "8088:8088/tcp"
+    depends_on:
+      - asterisk
