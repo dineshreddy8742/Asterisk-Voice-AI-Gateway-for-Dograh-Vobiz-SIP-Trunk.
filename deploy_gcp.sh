@@ -162,27 +162,34 @@ EOF
 # --- extensions.conf ---
 sudo tee /opt/asterisk-gateway/config/extensions.conf > /dev/null << EOF
 [from-external]
+exten => _+X.,1,NoOp(Incoming call from Vobiz to AI Extension with plus: \${EXTEN})
+ same => n,Stasis(dograh)
+ same => n,Hangup()
+
 exten => _X.,1,NoOp(Incoming call from Vobiz to AI Extension: \${EXTEN})
  same => n,Stasis(dograh)
  same => n,Hangup()
 
 [default]
 exten => _+X.,1,NoOp(Outbound call from Dograh to raw extension with plus: \${EXTEN})
- same => n,Set(CALLERID(num)=${VOBIZ_CALLERID_NUM})
+ same => n,Set(TEST_CID=\${FILTER(0123456789+,\${CALLERID(num)})})
+ same => n,ExecIf(\$[ \${LEN(\${TEST_CID})} < 10 ]?Set(CALLERID(num)=${VOBIZ_CALLERID_NUM}))
  same => n,Set(CALLERID(name)=${VOBIZ_CALLERID_NAME})
  same => n,Set(CLEAN_NUMBER=\${FILTER(0123456789+,\${EXTEN})})
- same => n,NoOp(Cleaned number to dial: \${CLEAN_NUMBER})
+ same => n,NoOp(Cleaned number to dial: \${CLEAN_NUMBER} using CallerID: \${CALLERID(num)})
  same => n,Dial(PJSIP/vobiz-trunk/sip:\${CLEAN_NUMBER}@${VOBIZ_DOMAIN})
  same => n,Hangup()
 
 exten => _X.,1,NoOp(Outbound call from Dograh to raw extension: \${EXTEN})
- same => n,Set(CALLERID(num)=${VOBIZ_CALLERID_NUM})
+ same => n,Set(TEST_CID=\${FILTER(0123456789+,\${CALLERID(num)})})
+ same => n,ExecIf(\$[ \${LEN(\${TEST_CID})} < 10 ]?Set(CALLERID(num)=${VOBIZ_CALLERID_NUM}))
  same => n,Set(CALLERID(name)=${VOBIZ_CALLERID_NAME})
  same => n,Set(CLEAN_NUMBER=\${FILTER(0123456789+,\${EXTEN})})
- same => n,NoOp(Cleaned number to dial: \${CLEAN_NUMBER})
+ same => n,NoOp(Cleaned number to dial: \${CLEAN_NUMBER} using CallerID: \${CALLERID(num)})
  same => n,Dial(PJSIP/vobiz-trunk/sip:\${CLEAN_NUMBER}@${VOBIZ_DOMAIN})
  same => n,Hangup()
 EOF
+
 
 # --- websocket_client.conf ---
 sudo tee /opt/asterisk-gateway/config/websocket_client.conf > /dev/null << 'EOF'
