@@ -23,5 +23,8 @@ services:
     command: python /app/ari_proxy.py
     ports:
       - "8088:8088/tcp"
+    environment:
+      - VOBIZ_DOMAIN=${VOBIZ_DOMAIN}
+      - VOBIZ_CALLERID_NUM=${VOBIZ_CALLERID_NUM}
     depends_on:
       - asterisk

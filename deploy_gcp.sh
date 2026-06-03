@@ -94,9 +94,13 @@ services:
     command: python /app/ari_proxy.py
     ports:
       - "8088:8088/tcp"
+    environment:
+      - VOBIZ_DOMAIN=${VOBIZ_DOMAIN}
+      - VOBIZ_CALLERID_NUM=${VOBIZ_CALLERID_NUM}
     depends_on:
       - asterisk
 EOF
+
 
 # 5. Write Asterisk configuration files dynamically using environment variables
 
@@ -208,10 +212,14 @@ import threading
 import select
 import urllib.parse
 import sys
+import os
 
 LISTEN_PORT = 8088
 ASTERISK_HOST = 'asterisk'
 ASTERISK_PORT = 8088
+
+VOBIZ_DOMAIN = os.environ.get('VOBIZ_DOMAIN', '455bdb01.sip.vobiz.ai')
+DEFAULT_CALLERID = os.environ.get('VOBIZ_CALLERID_NUM', '+918065481144')
 
 def sanitize_endpoint(endpoint_str):
     try:
@@ -221,11 +229,10 @@ def sanitize_endpoint(endpoint_str):
             tech = tech.strip()
             
             if tech.upper() in ['LOCAL', 'PJSIP']:
-                context = "default"
                 number_part = resource
                 
                 if '@' in resource:
-                    number_part, context = resource.split('@', 1)
+                    number_part, _ = resource.split('@', 1)
                 
                 if number_part.lower().startswith('sip:'):
                     number_part = number_part[4:]
@@ -234,7 +241,6 @@ def sanitize_endpoint(endpoint_str):
                 digits_only = ''.join(c for c in number_part if c.isdigit())
                 
                 if len(digits_only) >= 5:
-                    # Smart E.164 Normalization
                     if len(digits_only) == 10:
                         cleaned_number = f"+91{digits_only}"
                     elif len(digits_only) == 12 and digits_only.startswith('91'):
@@ -243,12 +249,20 @@ def sanitize_endpoint(endpoint_str):
                         prefix = "+" if has_plus else ""
                         cleaned_number = f"{prefix}{digits_only}"
                     
-                    new_endpoint = f"Local/{cleaned_number}@{context}"
+                    new_endpoint = f"PJSIP/vobiz-trunk/sip:{cleaned_number}@{VOBIZ_DOMAIN}"
                     print(f"[ARI Proxy] Normalized & Rewrote endpoint '{endpoint_str}' -> '{new_endpoint}'", flush=True)
                     return new_endpoint
     except Exception as e:
         print(f"[ARI Proxy] Error parsing endpoint '{endpoint_str}': {e}", flush=True)
     return endpoint_str
+
+def sanitize_callerid(callerid_str):
+    if not callerid_str:
+        return DEFAULT_CALLERID
+    digits_only = ''.join(c for c in callerid_str if c.isdigit())
+    if len(digits_only) < 10:
+        return DEFAULT_CALLERID
+    return callerid_str
 
 def handle_client(client_socket):
     try:
@@ -273,7 +287,6 @@ def handle_client(client_socket):
         if len(request_parts) >= 2 and request_parts[0] == 'POST' and ('/channels' in request_parts[1] or '/ari/channels' in request_parts[1]):
             method, uri, version = request_parts[0], request_parts[1], request_parts[2]
             
-            # 1. Sanitize inside URI query parameters
             url_parsed = urllib.parse.urlparse(uri)
             query_params = urllib.parse.parse_qs(url_parsed.query, keep_blank_values=True)
             
@@ -285,6 +298,16 @@ def handle_client(client_socket):
                     query_params['endpoint'] = [cleaned_endpoint]
                     modified = True
             
+            if 'callerId' in query_params:
+                original_cid = query_params['callerId'][0]
+                cleaned_cid = sanitize_callerid(original_cid)
+                if original_cid != cleaned_cid:
+                    query_params['callerId'] = [cleaned_cid]
+                    modified = True
+            else:
+                query_params['callerId'] = [DEFAULT_CALLERID]
+                modified = True
+            
             if modified:
                 new_query = urllib.parse.urlencode(query_params, doseq=True, quote_via=urllib.parse.quote)
                 new_uri = url_parsed.path
@@ -294,7 +317,6 @@ def handle_client(client_socket):
                 header_text = '\r\n'.join(lines)
                 header_bytes = header_text.encode('utf-8')
             
-            # 2. Sanitize inside POST body
             content_type = ""
             for line in lines:
                 if line.lower().startswith("content-type:"):
@@ -307,13 +329,26 @@ def handle_client(client_socket):
                     import json
                     try:
                         body_json = json.loads(body_bytes.decode('utf-8'))
-                        if isinstance(body_json, dict) and 'endpoint' in body_json:
-                            original_endpoint = body_json['endpoint']
-                            cleaned_endpoint = sanitize_endpoint(original_endpoint)
-                            if original_endpoint != cleaned_endpoint:
-                                body_json['endpoint'] = cleaned_endpoint
-                                body_bytes = json.dumps(body_json).encode('utf-8')
+                        if isinstance(body_json, dict):
+                            if 'endpoint' in body_json:
+                                original_endpoint = body_json['endpoint']
+                                cleaned_endpoint = sanitize_endpoint(original_endpoint)
+                                if original_endpoint != cleaned_endpoint:
+                                    body_json['endpoint'] = cleaned_endpoint
+                                    body_modified = True
+                            
+                            if 'callerId' in body_json:
+                                original_cid = body_json['callerId']
+                                cleaned_cid = sanitize_callerid(original_cid)
+                                if original_cid != cleaned_cid:
+                                    body_json['callerId'] = cleaned_cid
+                                    body_modified = True
+                            else:
+                                body_json['callerId'] = DEFAULT_CALLERID
                                 body_modified = True
+                                
+                            if body_modified:
+                                body_bytes = json.dumps(body_json).encode('utf-8')
                     except Exception as json_err:
                         print(f"[ARI Proxy] JSON parse error: {json_err}", flush=True)
                 elif "application/x-www-form-urlencoded" in content_type:
@@ -324,8 +359,20 @@ def handle_client(client_socket):
                             cleaned_endpoint = sanitize_endpoint(original_endpoint)
                             if original_endpoint != cleaned_endpoint:
                                 body_params['endpoint'] = [cleaned_endpoint]
-                                body_bytes = urllib.parse.urlencode(body_params, doseq=True, quote_via=urllib.parse.quote).encode('utf-8')
                                 body_modified = True
+                        
+                        if 'callerId' in body_params:
+                            original_cid = body_params['callerId'][0]
+                            cleaned_cid = sanitize_callerid(original_cid)
+                            if original_cid != cleaned_cid:
+                                body_params['callerId'] = [cleaned_cid]
+                                body_modified = True
+                        else:
+                            body_params['callerId'] = [DEFAULT_CALLERID]
+                            body_modified = True
+                            
+                        if body_modified:
+                            body_bytes = urllib.parse.urlencode(body_params, doseq=True, quote_via=urllib.parse.quote).encode('utf-8')
                     except Exception as form_err:
                         print(f"[ARI Proxy] Form urlencode parse error: {form_err}", flush=True)
                 
@@ -343,7 +390,6 @@ def handle_client(client_socket):
     except Exception as e:
         print(f"[ARI Proxy] Non-fatal request parsing error: {e}", flush=True)
 
-    # Forward to Asterisk
     asterisk_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         asterisk_socket.connect((ASTERISK_HOST, ASTERISK_PORT))
@@ -360,7 +406,6 @@ def handle_client(client_socket):
         asterisk_socket.close()
         return
 
-    # Pipe bidirectional tunnel (works perfectly for both HTTP and WebSockets)
     sockets = [client_socket, asterisk_socket]
     try:
         while True:

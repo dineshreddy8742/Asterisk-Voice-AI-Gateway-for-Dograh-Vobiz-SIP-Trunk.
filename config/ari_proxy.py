@@ -3,10 +3,15 @@ import threading
 import select
 import urllib.parse
 import sys
+import os
 
 LISTEN_PORT = 8088
 ASTERISK_HOST = 'asterisk'
 ASTERISK_PORT = 8088
+
+# Read settings from environment variables passed by docker-compose
+VOBIZ_DOMAIN = os.environ.get('VOBIZ_DOMAIN', '455bdb01.sip.vobiz.ai')
+DEFAULT_CALLERID = os.environ.get('VOBIZ_CALLERID_NUM', '+918065481144')
 
 def sanitize_endpoint(endpoint_str):
     try:
@@ -16,11 +21,10 @@ def sanitize_endpoint(endpoint_str):
             tech = tech.strip()
             
             if tech.upper() in ['LOCAL', 'PJSIP']:
-                context = "default"
                 number_part = resource
                 
                 if '@' in resource:
-                    number_part, context = resource.split('@', 1)
+                    number_part, _ = resource.split('@', 1)
                 
                 if number_part.lower().startswith('sip:'):
                     number_part = number_part[4:]
@@ -38,13 +42,23 @@ def sanitize_endpoint(endpoint_str):
                         prefix = "+" if has_plus else ""
                         cleaned_number = f"{prefix}{digits_only}"
                     
-                    new_endpoint = f"Local/{cleaned_number}@{context}"
+                    # Direct PJSIP Origination ensures the call only enters Stasis when answered
+                    # and ends immediately when the customer hangs up.
+                    new_endpoint = f"PJSIP/vobiz-trunk/sip:{cleaned_number}@{VOBIZ_DOMAIN}"
                     print(f"[ARI Proxy] Normalized & Rewrote endpoint '{endpoint_str}' -> '{new_endpoint}'", flush=True)
                     return new_endpoint
     except Exception as e:
         print(f"[ARI Proxy] Error parsing endpoint '{endpoint_str}': {e}", flush=True)
     return endpoint_str
 
+def sanitize_callerid(callerid_str):
+    if not callerid_str:
+        return DEFAULT_CALLERID
+    # Verify the callerId is a valid phone number (at least 10 digits)
+    digits_only = ''.join(c for c in callerid_str if c.isdigit())
+    if len(digits_only) < 10:
+        return DEFAULT_CALLERID
+    return callerid_str
 
 def handle_client(client_socket):
     try:
@@ -81,6 +95,17 @@ def handle_client(client_socket):
                     query_params['endpoint'] = [cleaned_endpoint]
                     modified = True
             
+            # Sanitize & enforce callerId in query parameters
+            if 'callerId' in query_params:
+                original_cid = query_params['callerId'][0]
+                cleaned_cid = sanitize_callerid(original_cid)
+                if original_cid != cleaned_cid:
+                    query_params['callerId'] = [cleaned_cid]
+                    modified = True
+            else:
+                query_params['callerId'] = [DEFAULT_CALLERID]
+                modified = True
+            
             if modified:
                 new_query = urllib.parse.urlencode(query_params, doseq=True, quote_via=urllib.parse.quote)
                 new_uri = url_parsed.path
@@ -103,13 +128,26 @@ def handle_client(client_socket):
                     import json
                     try:
                         body_json = json.loads(body_bytes.decode('utf-8'))
-                        if isinstance(body_json, dict) and 'endpoint' in body_json:
-                            original_endpoint = body_json['endpoint']
-                            cleaned_endpoint = sanitize_endpoint(original_endpoint)
-                            if original_endpoint != cleaned_endpoint:
-                                body_json['endpoint'] = cleaned_endpoint
-                                body_bytes = json.dumps(body_json).encode('utf-8')
+                        if isinstance(body_json, dict):
+                            if 'endpoint' in body_json:
+                                original_endpoint = body_json['endpoint']
+                                cleaned_endpoint = sanitize_endpoint(original_endpoint)
+                                if original_endpoint != cleaned_endpoint:
+                                    body_json['endpoint'] = cleaned_endpoint
+                                    body_modified = True
+                            
+                            if 'callerId' in body_json:
+                                original_cid = body_json['callerId']
+                                cleaned_cid = sanitize_callerid(original_cid)
+                                if original_cid != cleaned_cid:
+                                    body_json['callerId'] = cleaned_cid
+                                    body_modified = True
+                            else:
+                                body_json['callerId'] = DEFAULT_CALLERID
                                 body_modified = True
+                                
+                            if body_modified:
+                                body_bytes = json.dumps(body_json).encode('utf-8')
                     except Exception as json_err:
                         print(f"[ARI Proxy] JSON parse error: {json_err}", flush=True)
                 elif "application/x-www-form-urlencoded" in content_type:
@@ -120,8 +158,20 @@ def handle_client(client_socket):
                             cleaned_endpoint = sanitize_endpoint(original_endpoint)
                             if original_endpoint != cleaned_endpoint:
                                 body_params['endpoint'] = [cleaned_endpoint]
-                                body_bytes = urllib.parse.urlencode(body_params, doseq=True, quote_via=urllib.parse.quote).encode('utf-8')
                                 body_modified = True
+                        
+                        if 'callerId' in body_params:
+                            original_cid = body_params['callerId'][0]
+                            cleaned_cid = sanitize_callerid(original_cid)
+                            if original_cid != cleaned_cid:
+                                body_params['callerId'] = [cleaned_cid]
+                                body_modified = True
+                        else:
+                            body_params['callerId'] = [DEFAULT_CALLERID]
+                            body_modified = True
+                            
+                        if body_modified:
+                            body_bytes = urllib.parse.urlencode(body_params, doseq=True, quote_via=urllib.parse.quote).encode('utf-8')
                     except Exception as form_err:
                         print(f"[ARI Proxy] Form urlencode parse error: {form_err}", flush=True)
                 
@@ -184,8 +234,8 @@ def main():
     
     while True:
         try:
-            client_sock, _ = server.accept()
-            t = threading.Thread(target=handle_client, args=(client_sock,))
+            server_sock, _ = server.accept()
+            t = threading.Thread(target=handle_client, args=(server_sock,))
             t.daemon = True
             t.start()
         except KeyboardInterrupt:
